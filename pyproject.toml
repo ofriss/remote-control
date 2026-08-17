@@ -1,0 +1,2 @@
+[tool.pytest.ini_options]
+pythonpath = ["."] # so pytest knows where is the src path

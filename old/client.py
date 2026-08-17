@@ -3,26 +3,17 @@ import struct
 from PIL import ImageGrab
 from io import BytesIO
 
-CHUNK_SIZE = 1024
-ADDR = ("127.0.0.1", 9999)
-RECV_BUF = 65536
-ACK_TIMEOUT = 2.0 # how long to wait for DONE/MISSING before giving up on the frame
-
-META_TAG = b"META"
-META_HEADER_FMT = "!IHHH" # total_size (4 bytes), total_chunks (2), width (2), height (2)
-
-DATA_TAG = b"DATA"
-DATA_HEADER_FMT = "!H" # chunk_index (2 bytes); the count lives in META, so it is not repeated here
-
-DONE_TAG = b"DONE"
-
-MISSING_TAG = b"MISSING"
-MISSING_INDEX_FMT = "H"
-MISSING_INDEX_SIZE = struct.calcsize("!" + MISSING_INDEX_FMT) # match the server's "!" packing, not native alignment
+from old.protocol import (
+    CHUNK_SIZE, ADDR, RECV_BUF, ACK_TIMEOUT,
+    META_TAG, META_HEADER_FMT,
+    DATA_TAG, DATA_HEADER_FMT,
+    HELO_TAG, DONE_TAG, GO_TAG, WAIT_TAG,
+    MISSING_TAG, MISSING_INDEX_FMT, MISSING_INDEX_SIZE,
+)
 
 
 class ImageSender:
-    """Sends one screenshot per call as chunked UDP packets, honouring retransmit requests."""
+    """Sends one screenshot per call as chunked UDP packets, but only while it holds the floor."""
 
     def __init__(self, sock: socket.socket) -> None:
         """Bind the sender to a connected socket that already has a timeout configured."""
@@ -30,6 +21,7 @@ class ImageSender:
         self.img_bytes: bytes = b"" # image data
         self.total_chunks: int = 0 # count of chunks (packets)
         self.resolution: tuple[int, int] = (0, 0) # (width, height) of the captured screen
+        self.active: bool = False # whether the server has handed us the floor
 
     @staticmethod
     def capture() -> tuple[bytes, tuple[int, int]]:
@@ -46,6 +38,18 @@ class ImageSender:
         count = len(index_data) // MISSING_INDEX_SIZE
         return struct.unpack(f"!{count}{MISSING_INDEX_FMT}", index_data)
 
+    def register(self) -> None:
+        """Announce ourselves until the server grants the floor, capturing nothing while we wait."""
+        while not self.active:
+            try:
+                self.sock.send(HELO_TAG)
+                resp = self.sock.recv(RECV_BUF)
+            except (socket.timeout, ConnectionRefusedError):
+                continue # server is down, gone, or busy with someone else; announce again
+
+            if resp == GO_TAG: # only GO grants the floor, so a duplicate WAIT is inert here
+                self.active = True
+
     def send_meta(self) -> None:
         """Announce the size, chunk count and resolution of the current frame, before any DATA."""
         header = struct.pack(META_HEADER_FMT, len(self.img_bytes), self.total_chunks, *self.resolution)
@@ -57,7 +61,7 @@ class ImageSender:
         self.sock.send(DATA_TAG + header + self.img_bytes[idx * CHUNK_SIZE : (idx + 1) * CHUNK_SIZE])
 
     def await_ack(self) -> None:
-        """Resend whatever the server reports missing until it sends DONE or falls silent."""
+        """Resend whatever the server reports missing until it sends DONE, revokes us, or falls silent."""
         while True:
             try:
                 resp = self.sock.recv(RECV_BUF)
@@ -66,9 +70,13 @@ class ImageSender:
 
             if resp == DONE_TAG:
                 return
+            if resp == WAIT_TAG:
+                self.active = False
+                return # floor revoked mid-frame; abandon it rather than keep sending
             if resp.startswith(MISSING_TAG):
                 for idx in self.parse_missing(resp):
                     self.send_chunk(idx)
+            # a GO can cross a HELO in flight and arrive here; ignoring it leaves the frame untouched
 
     def send_image(self) -> None:
         """Capture the screen and deliver it as one frame, serving retransmits until acked."""
@@ -84,9 +92,19 @@ class ImageSender:
 
         self.await_ack()
 
+    def run(self) -> None:
+        """Stream frames back to back while we hold the floor, and wait quietly whenever we do not."""
+        while True:
+            self.register()
+            while self.active:
+                try:
+                    self.send_image()
+                except ConnectionRefusedError:
+                    self.active = False # server vanished mid-stream; park and announce ourselves again
+
 
 if __name__ == "__main__":
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.connect(ADDR) # connected socket, so plain send/recv is enough
     sock.settimeout(ACK_TIMEOUT)
-    ImageSender(sock).send_image()
+    ImageSender(sock).run()
