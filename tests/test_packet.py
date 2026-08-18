@@ -2,7 +2,7 @@ from struct import pack, unpack
 
 import pytest
 
-from constants import META_PACKET_PD_FMT, META_PACKET_PD_LEN
+from constants import META_PACKET_PD_FMT, META_PACKET_PD_LEN, PACKET_HEADER_LEN
 from packet import (
     BasePacketFactory,
     BasePacketWrapper,
@@ -31,12 +31,12 @@ def test_packet_to_bytes_encodes_type_length_and_payload():
     payload = b"hello"
     packet = Packet(PacketType.DATA, payload)
 
-    encoded = packet.to_bytes()
+    encoded = Packet.to_bytes(packet)
 
-    packet_type, length = unpack("!BH", encoded[:3])
+    packet_type, length = unpack("!BH", encoded[:PACKET_HEADER_LEN])
     assert packet_type == PacketType.DATA
     assert length == len(payload)
-    assert encoded[3:] == payload
+    assert encoded[PACKET_HEADER_LEN:] == payload
 
 
 def test_packet_to_bytes_length_tracks_payload_not_a_stored_field():
@@ -44,8 +44,59 @@ def test_packet_to_bytes_length_tracks_payload_not_a_stored_field():
     short = Packet(PacketType.DATA, b"a")
     long_ = Packet(PacketType.DATA, b"a" * 10)
 
-    assert unpack("!BH", short.to_bytes()[:3])[1] == 1
-    assert unpack("!BH", long_.to_bytes()[:3])[1] == 10
+    assert unpack("!BH", Packet.to_bytes(short)[:PACKET_HEADER_LEN])[1] == 1
+    assert unpack("!BH", Packet.to_bytes(long_)[:PACKET_HEADER_LEN])[1] == 10
+
+
+def test_packet_to_bytes_empty_payload():
+    packet = Packet(PacketType.WAIT, b"")
+    encoded = Packet.to_bytes(packet)
+
+    packet_type, length = unpack("!BH", encoded)
+    assert packet_type == PacketType.WAIT
+    assert length == 0
+
+
+# --- Packet.from_bytes ---
+
+def test_packet_from_bytes_decodes_type_and_payload():
+    payload = b"hello"
+    encoded = pack("!BH", PacketType.DATA, len(payload)) + payload
+
+    packet = Packet.from_bytes(encoded)
+
+    assert packet.type == PacketType.DATA
+    assert packet.payload == payload
+
+
+def test_packet_from_bytes_ignores_trailing_bytes_past_declared_length():
+    # Regression test: from_bytes must slice the payload to exactly `length`
+    # bytes, not swallow everything left in the buffer. Otherwise stray bytes
+    # after a packet (e.g. a reused/oversized recv buffer) leak into payload.
+    payload = b"abc"
+    trailing_garbage = b"GARBAGE-NOT-PART-OF-THIS-PACKET"
+    encoded = pack("!BH", PacketType.DATA, len(payload)) + payload + trailing_garbage
+
+    packet = Packet.from_bytes(encoded)
+
+    assert packet.payload == payload
+
+
+def test_packet_from_bytes_empty_payload():
+    encoded = pack("!BH", PacketType.WAIT, 0)
+    packet = Packet.from_bytes(encoded)
+
+    assert packet.type == PacketType.WAIT
+    assert packet.payload == b""
+
+
+def test_packet_round_trips_through_bytes():
+    original = Packet(PacketType.META, b"round-trip-payload")
+
+    restored = Packet.from_bytes(Packet.to_bytes(original))
+
+    assert restored.type == original.type
+    assert restored.payload == original.payload
 
 
 # --- BasePacketWrapper ---
@@ -121,3 +172,14 @@ def test_meta_packet_factory_round_trips_through_wrapper():
     assert wrapper.total_img_size == 999
     assert wrapper.total_chunks == 42
     assert wrapper.resolution == Resolution(width=640, height=480)
+
+
+def test_meta_packet_factory_round_trips_through_bytes_and_wrapper():
+    packet = MetaPacketFactory.create(total_img_size=555, total_chunks=3, width=1024, height=768)
+
+    restored = Packet.from_bytes(Packet.to_bytes(packet))
+    wrapper = MetaWrapper(restored)
+
+    assert wrapper.total_img_size == 555
+    assert wrapper.total_chunks == 3
+    assert wrapper.resolution == Resolution(width=1024, height=768)
