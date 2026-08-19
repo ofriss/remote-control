@@ -2,14 +2,30 @@ from struct import pack, unpack
 
 import pytest
 
-from constants import META_PACKET_PD_FMT, META_PACKET_PD_LEN, PACKET_HEADER_LEN
+from constants import (
+    DATA_PACKET_PD_FMT,
+    DATA_PACKET_PD_LEN,
+    META_PACKET_PD_FMT,
+    META_PACKET_PD_LEN,
+    MISSING_PACKET_PD_LEN_BASE,
+    PACKET_HEADER_LEN,
+    create_missing_packet_pd_fmt,
+)
 from packet import (
     BasePacketFactory,
     BasePacketWrapper,
+    DataPacketFactory,
+    DataPacketWrapper,
+    DonePacketFactory,
+    GoPacketFactory,
+    HelloPacketFactory,
     MetaPacketFactory,
-    MetaWrapper,
+    MetaPacketWrapper,
+    MissingPacketFactory,
+    MissingPacketWrapper,
     Packet,
     PacketType,
+    WaitPacketFactory,
 )
 from typedefs import Resolution
 
@@ -119,7 +135,7 @@ def test_base_wrapper_rejects_wrong_payload_length():
         BasePacketWrapper(packet, PacketType.DONE, 3)
 
 
-# --- MetaWrapper ---
+# --- MetaPacketWrapper ---
 
 def make_meta_packet(total_img_size=12345, total_chunks=13, width=1920, height=1080) -> Packet:
     payload = pack(META_PACKET_PD_FMT, total_img_size, total_chunks, width, height)
@@ -129,7 +145,7 @@ def make_meta_packet(total_img_size=12345, total_chunks=13, width=1920, height=1
 def test_meta_wrapper_parses_payload_fields():
     packet = make_meta_packet(total_img_size=54321, total_chunks=7, width=1280, height=720)
 
-    wrapper = MetaWrapper(packet)
+    wrapper = MetaPacketWrapper(packet)
 
     assert wrapper.total_img_size == 54321
     assert wrapper.total_chunks == 7
@@ -139,13 +155,69 @@ def test_meta_wrapper_parses_payload_fields():
 def test_meta_wrapper_rejects_non_meta_packet():
     packet = Packet(PacketType.DATA, b"\x00" * META_PACKET_PD_LEN)
     with pytest.raises(ValueError):
-        MetaWrapper(packet)
+        MetaPacketWrapper(packet)
 
 
 def test_meta_wrapper_rejects_wrong_length_payload():
     packet = Packet(PacketType.META, b"\x00" * (META_PACKET_PD_LEN - 1))
     with pytest.raises(ValueError):
-        MetaWrapper(packet)
+        MetaPacketWrapper(packet)
+
+
+# --- DataPacketWrapper ---
+
+def test_data_wrapper_parses_chunk_index():
+    packet = Packet(PacketType.DATA, pack(DATA_PACKET_PD_FMT, 42))
+
+    wrapper = DataPacketWrapper(packet)
+
+    assert wrapper.chunk_index == 42
+
+
+def test_data_wrapper_rejects_non_data_packet():
+    packet = Packet(PacketType.META, b"\x00" * DATA_PACKET_PD_LEN)
+    with pytest.raises(ValueError):
+        DataPacketWrapper(packet)
+
+
+def test_data_wrapper_rejects_wrong_length_payload():
+    packet = Packet(PacketType.DATA, b"\x00" * (DATA_PACKET_PD_LEN + 1))
+    with pytest.raises(ValueError):
+        DataPacketWrapper(packet)
+
+
+# --- MissingPacketWrapper ---
+
+def test_missing_wrapper_parses_empty_indices():
+    packet = Packet(PacketType.MISSING, b"")
+
+    wrapper = MissingPacketWrapper(packet)
+
+    assert wrapper.indices == set()
+
+
+def test_missing_wrapper_parses_single_index():
+    payload = pack(create_missing_packet_pd_fmt(1), 5)
+    packet = Packet(PacketType.MISSING, payload)
+
+    wrapper = MissingPacketWrapper(packet)
+
+    assert wrapper.indices == {5}
+
+
+def test_missing_wrapper_parses_multiple_indices():
+    payload = pack(create_missing_packet_pd_fmt(3), 1, 2, 3)
+    packet = Packet(PacketType.MISSING, payload)
+
+    wrapper = MissingPacketWrapper(packet)
+
+    assert wrapper.indices == {1, 2, 3}
+
+
+def test_missing_wrapper_rejects_non_missing_packet():
+    packet = Packet(PacketType.DATA, b"")
+    with pytest.raises(ValueError):
+        MissingPacketWrapper(packet)
 
 
 # --- BasePacketFactory ---
@@ -167,7 +239,7 @@ def test_meta_packet_factory_creates_meta_packet():
 def test_meta_packet_factory_round_trips_through_wrapper():
     packet = MetaPacketFactory.create(total_img_size=999, total_chunks=42, width=640, height=480)
 
-    wrapper = MetaWrapper(packet)
+    wrapper = MetaPacketWrapper(packet)
 
     assert wrapper.total_img_size == 999
     assert wrapper.total_chunks == 42
@@ -178,8 +250,104 @@ def test_meta_packet_factory_round_trips_through_bytes_and_wrapper():
     packet = MetaPacketFactory.create(total_img_size=555, total_chunks=3, width=1024, height=768)
 
     restored = Packet.from_bytes(Packet.to_bytes(packet))
-    wrapper = MetaWrapper(restored)
+    wrapper = MetaPacketWrapper(restored)
 
     assert wrapper.total_img_size == 555
     assert wrapper.total_chunks == 3
     assert wrapper.resolution == Resolution(width=1024, height=768)
+
+
+# --- DataPacketFactory ---
+
+def test_data_packet_factory_creates_data_packet():
+    packet = DataPacketFactory.create(chunk_index=7)
+
+    assert packet.type == PacketType.DATA
+    assert packet.payload == pack(DATA_PACKET_PD_FMT, 7)
+
+
+def test_data_packet_factory_round_trips_through_wrapper():
+    packet = DataPacketFactory.create(chunk_index=321)
+
+    wrapper = DataPacketWrapper(packet)
+
+    assert wrapper.chunk_index == 321
+
+
+def test_data_packet_factory_round_trips_through_bytes_and_wrapper():
+    packet = DataPacketFactory.create(chunk_index=65535)
+
+    restored = Packet.from_bytes(Packet.to_bytes(packet))
+    wrapper = DataPacketWrapper(restored)
+
+    assert wrapper.chunk_index == 65535
+
+
+# --- DonePacketFactory ---
+
+def test_done_packet_factory_creates_done_packet():
+    packet = DonePacketFactory.create()
+
+    assert packet.type == PacketType.DONE
+    assert packet.payload == b""
+
+
+# --- MissingPacketFactory ---
+
+def test_missing_packet_factory_creates_missing_packet_with_empty_indices():
+    packet = MissingPacketFactory.create(set())
+
+    assert packet.type == PacketType.MISSING
+    assert packet.payload == b""
+
+
+def test_missing_packet_factory_encodes_indices_into_payload():
+    packet = MissingPacketFactory.create({1, 2, 3})
+
+    assert packet.type == PacketType.MISSING
+    assert len(packet.payload) == 3 * MISSING_PACKET_PD_LEN_BASE
+    assert set(unpack(create_missing_packet_pd_fmt(3), packet.payload)) == {1, 2, 3}
+
+
+def test_missing_packet_factory_round_trips_through_wrapper():
+    packet = MissingPacketFactory.create({4, 5})
+
+    wrapper = MissingPacketWrapper(packet)
+
+    assert wrapper.indices == {4, 5}
+
+
+def test_missing_packet_factory_round_trips_through_bytes_and_wrapper():
+    packet = MissingPacketFactory.create({10, 20, 30})
+
+    restored = Packet.from_bytes(Packet.to_bytes(packet))
+    wrapper = MissingPacketWrapper(restored)
+
+    assert wrapper.indices == {10, 20, 30}
+
+
+# --- HelloPacketFactory ---
+
+def test_hello_packet_factory_creates_hello_packet():
+    packet = HelloPacketFactory.create()
+
+    assert packet.type == PacketType.HELLO
+    assert packet.payload == b""
+
+
+# --- GoPacketFactory ---
+
+def test_go_packet_factory_creates_go_packet():
+    packet = GoPacketFactory.create()
+
+    assert packet.type == PacketType.GO
+    assert packet.payload == b""
+
+
+# --- WaitPacketFactory ---
+
+def test_wait_packet_factory_creates_wait_packet():
+    packet = WaitPacketFactory.create()
+
+    assert packet.type == PacketType.WAIT
+    assert packet.payload == b""

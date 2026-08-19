@@ -6,10 +6,14 @@ from enum import IntEnum
 from struct import pack, unpack
 
 from constants import (
+    DATA_PACKET_PD_FMT,
+    DATA_PACKET_PD_LEN,
     META_PACKET_PD_FMT,
     META_PACKET_PD_LEN,
+    MISSING_PACKET_PD_LEN_BASE,
     PACKET_HEADER_FMT,
     PACKET_HEADER_LEN,
+    create_missing_packet_pd_fmt,
 )
 from typedefs import Resolution
 
@@ -53,14 +57,18 @@ class Packet:
     # prepare packet bytes to send
     @staticmethod
     def to_bytes(packet: Packet) -> bytes:
-        return pack(PACKET_HEADER_FMT, packet.type, len(packet.payload)) + packet.payload
+        return (
+            pack(PACKET_HEADER_FMT, packet.type, len(packet.payload)) + packet.payload
+        )
 
     # create packet from bytes received
     @staticmethod
     def from_bytes(packet_bytes: bytes) -> Packet:
         header = packet_bytes[:PACKET_HEADER_LEN]
         type, length = unpack(PACKET_HEADER_FMT, header)
-        payload = packet_bytes[PACKET_HEADER_LEN:PACKET_HEADER_LEN + length] # from header to header + length (payload end). Safer approach than [PACKET_HEADER_LEN:]. Ensures irrelevant bytes are not accidentally grabbed.
+        payload = packet_bytes[
+            PACKET_HEADER_LEN : PACKET_HEADER_LEN + length
+        ]  # from header to header + length (payload end). Safer approach than [PACKET_HEADER_LEN:]. Ensures irrelevant bytes are not accidentally grabbed.
         return Packet(type, payload)
 
 
@@ -85,7 +93,7 @@ class BasePacketWrapper(ABC):
 
 
 # Meta packet wrapper
-class MetaWrapper(BasePacketWrapper):
+class MetaPacketWrapper(BasePacketWrapper):
     # payload
     total_img_size: int  # 4 bytes
     total_chunks: int  # 2 bytes
@@ -99,6 +107,35 @@ class MetaWrapper(BasePacketWrapper):
             self.packet.payload,
         )
         self.resolution = Resolution(width=width, height=height)
+
+
+class DataPacketWrapper(BasePacketWrapper):
+    # payload
+    chunk_index: int  # 2 bytes
+
+    def __init__(self, packet: Packet):
+        super().__init__(packet, PacketType.DATA, DATA_PACKET_PD_LEN)
+
+        (self.chunk_index,) = unpack(DATA_PACKET_PD_FMT, self.packet.payload)
+
+
+class MissingPacketWrapper(BasePacketWrapper):
+    # payload
+    indices: set[int]  # x2 bytes
+
+    def __init__(self, packet: Packet):
+        payload_len = len(packet.payload)
+        indices_count = payload_len // MISSING_PACKET_PD_LEN_BASE
+
+        super().__init__(
+            packet,
+            PacketType.MISSING,
+            payload_len,
+        )
+
+        self.indices = set(unpack(
+            create_missing_packet_pd_fmt(indices_count), self.packet.payload
+        ))
 
 
 # A base packet factory class used to construct specific kinds of packets
@@ -121,3 +158,45 @@ class MetaPacketFactory(BasePacketFactory):
             PacketType.META,
             pack(META_PACKET_PD_FMT, total_img_size, total_chunks, width, height),
         )
+
+
+class DataPacketFactory(BasePacketFactory):
+    @staticmethod
+    def create(chunk_index: int) -> Packet:
+        return Packet(PacketType.DATA, pack(DATA_PACKET_PD_FMT, chunk_index))
+
+
+class DonePacketFactory(BasePacketFactory):
+    @staticmethod
+    def create() -> Packet:
+        return Packet(PacketType.DONE, b"")
+
+
+class MissingPacketFactory(BasePacketFactory):
+    @staticmethod
+    def create(indices: set[int]) -> Packet:
+        return Packet(
+            PacketType.MISSING,
+            pack(create_missing_packet_pd_fmt(len(indices)), *indices),
+        )
+
+
+class HelloPacketFactory(BasePacketFactory):
+    @staticmethod
+    def create() -> Packet:
+        return Packet(PacketType.HELLO, b"")
+
+
+class GoPacketFactory(BasePacketFactory):
+    @staticmethod
+    def create() -> Packet:
+        return Packet(PacketType.GO, b"")
+
+
+class WaitPacketFactory(BasePacketFactory):
+    @staticmethod
+    def create() -> Packet:
+        return Packet(PacketType.WAIT, b"")
+
+
+# TODO: add max size validation checks (maybe chunks too)
